@@ -23,6 +23,7 @@
 #include "bitmap.h"
 #include "coverage.h"
 #include "hash.h"
+#include "ofproto/ofproto-dpif.h"
 #include "openvswitch/list.h"
 #include "openvswitch/poll-loop.h"
 #include "timeval.h"
@@ -209,6 +210,7 @@ mac_learning_create(unsigned int idle_time)
     ml->idle_time = normalize_idle_time(idle_time);
     ml->max_entries = MAC_DEFAULT_MAX;
     ml->need_revalidate = false;
+    ml->fallback = false;
     hmap_init(&ml->ports_by_ptr);
     heap_init(&ml->ports_by_usage);
     ovs_refcount_init(&ml->ref_cnt);
@@ -378,7 +380,23 @@ is_mac_learning_update_needed(const struct mac_learning *ml,
     }
 
     mac = mac_learning_lookup(ml, src, vlan);
-    if (!mac || mac_entry_age(ml, mac)) {
+    if (!mac) {
+        return true;
+    }
+
+    int age = mac_entry_age(ml, mac);
+    if (!ml->fallback) {
+        if (age >= 10) {
+            return true;
+        }
+        struct ofbundle* port = mac_entry_get_port(ml, mac);
+        if (strcmp(port->name, ((struct ofbundle*)in_port)->name)) {
+            return false;
+        }
+        return age > 0;
+    }
+
+    if (age > 0) {
         return true;
     }
 
