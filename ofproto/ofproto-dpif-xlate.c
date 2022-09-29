@@ -8046,7 +8046,12 @@ xlate_mac_learning_update(const struct ofproto_dpif *ofproto,
         return;
     }
 
-    update_learning_table__(xbridge, xbundle, dl_src, vlan, is_grat_arp);
+    if (!update_learning_table__(xbridge, xbundle, dl_src, vlan,
+                                 is_grat_arp)) {
+        VLOG_DBG("bridge %s: learned that "ETH_ADDR_FMT" is "
+                 "on port %s in VLAN %d", xbridge->name,
+                 ETH_ADDR_ARGS(dl_src), xbundle->name, vlan);
+    }
 }
 
 void
