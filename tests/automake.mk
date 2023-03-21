@@ -431,12 +431,14 @@ $(srcdir)/package.m4: $(top_srcdir)/configure.ac
 noinst_PROGRAMS += tests/test-ovsdb
 tests_test_ovsdb_SOURCES = tests/test-ovsdb.c
 nodist_tests_test_ovsdb_SOURCES = tests/idltest.c tests/idltest.h
-tests_test_ovsdb_LDADD = ovsdb/libovsdb.la lib/libopenvswitch.la
+tests_test_ovsdb_LDADD = ovsdb/libovsdb.la lib/libopenvswitch.la \
+	/usr/src/dpdk-stable-21.11.1/build/drivers/librte_net_bond.a
 
 noinst_PROGRAMS += tests/test-lib
 tests_test_lib_SOURCES = \
 	tests/test-lib.c
-tests_test_lib_LDADD = lib/libopenvswitch.la
+tests_test_lib_LDADD = lib/libopenvswitch.la \
+	/usr/src/dpdk-stable-21.11.1/build/drivers/librte_net_bond.a
 
 # idltest schema and IDL
 OVSIDL_BUILT += tests/idltest.c tests/idltest.h tests/idltest.ovsidl
@@ -505,11 +507,13 @@ tests_ovstest_SOURCES += \
 	tests/test-netlink-policy.c
 endif
 
-tests_ovstest_LDADD = lib/libopenvswitch.la
+tests_ovstest_LDADD = lib/libopenvswitch.la \
+	/usr/src/dpdk-stable-21.11.1/build/drivers/librte_net_bond.a
 
 noinst_PROGRAMS += tests/test-stream
 tests_test_stream_SOURCES = tests/test-stream.c
-tests_test_stream_LDADD = lib/libopenvswitch.la
+tests_test_stream_LDADD = lib/libopenvswitch.la \
+	/usr/src/dpdk-stable-21.11.1/build/drivers/librte_net_bond.a
 
 noinst_PROGRAMS += tests/test-strtok_r
 tests_test_strtok_r_SOURCES = tests/test-strtok_r.c

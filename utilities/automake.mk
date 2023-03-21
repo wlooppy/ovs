@@ -105,26 +105,38 @@ man_MANS += \
 	utilities/ovs-vsctl.8
 
 utilities_ovs_appctl_SOURCES = utilities/ovs-appctl.c
-utilities_ovs_appctl_LDADD = lib/libopenvswitch.la
+
+utilities_ovs_appctl_LDADD = \
+	lib/libopenvswitch.la \
+	/usr/src/dpdk-stable-21.11.1/build/drivers/librte_net_bond.a
 
 utilities_ovs_testcontroller_SOURCES = utilities/ovs-testcontroller.c
-utilities_ovs_testcontroller_LDADD = lib/libopenvswitch.la $(SSL_LIBS)
+
+utilities_ovs_testcontroller_LDADD = \
+        lib/libopenvswitch.la $(SSL_LIBS) \
+	/usr/src/dpdk-stable-21.11.1/build/drivers/librte_net_bond.a
 
 utilities_ovs_dpctl_SOURCES = utilities/ovs-dpctl.c
-utilities_ovs_dpctl_LDADD = lib/libopenvswitch.la
+utilities_ovs_dpctl_LDADD = \
+	lib/libopenvswitch.la \
+	/usr/src/dpdk-stable-21.11.1/build/drivers/librte_net_bond.a
 
 utilities_ovs_ofctl_SOURCES = utilities/ovs-ofctl.c
 utilities_ovs_ofctl_LDADD = \
 	ofproto/libofproto.la \
-	lib/libopenvswitch.la
+	lib/libopenvswitch.la \
+	/usr/src/dpdk-stable-21.11.1/build/drivers/librte_net_bond.a
 
 utilities_ovs_vsctl_SOURCES = utilities/ovs-vsctl.c
-utilities_ovs_vsctl_LDADD = lib/libopenvswitch.la
+utilities_ovs_vsctl_LDADD = \
+	lib/libopenvswitch.la \
+	/usr/src/dpdk-stable-21.11.1/build/drivers/librte_net_bond.a
 
 if LINUX
 noinst_PROGRAMS += utilities/nlmon
 utilities_nlmon_SOURCES = utilities/nlmon.c
-utilities_nlmon_LDADD = lib/libopenvswitch.la
+utilities_nlmon_LDADD = lib/libopenvswitch.la \
+	/usr/src/dpdk-stable-21.11.1/build/drivers/librte_net_bond.a
 endif
 
 FLAKE8_PYFILES += utilities/ovs-pcap.in \

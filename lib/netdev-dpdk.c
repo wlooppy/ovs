@@ -442,6 +442,12 @@ struct netdev_dpdk {
             /* Identifier used to distinguish vhost devices from each other. */
             char *vhost_id;
         };
+        char *devargs_slave1;
+        dpdk_port_t slave1_port_id;
+        bool devargs_slave1_attached;
+        char *devargs_slave2;
+        dpdk_port_t slave2_port_id;
+        bool devargs_slave2_attached;
         struct dpdk_tx_queue *tx_q;
         struct rte_eth_link link;
     );
@@ -953,7 +959,7 @@ dpdk_watchdog(void *dummy OVS_UNUSED)
 }
 
 static int
-dpdk_eth_dev_port_config(struct netdev_dpdk *dev, int n_rxq, int n_txq)
+dpdk_eth_dev_port_config(struct netdev_dpdk *dev, dpdk_port_t port_id, int n_rxq, int n_txq)
 {
     int diag = 0;
     int i;
@@ -961,7 +967,7 @@ dpdk_eth_dev_port_config(struct netdev_dpdk *dev, int n_rxq, int n_txq)
     struct rte_eth_dev_info info;
     uint16_t conf_mtu;
 
-    rte_eth_dev_info_get(dev->port_id, &info);
+    rte_eth_dev_info_get(port_id, &info);
 
     /* As of DPDK 17.11.1 a few PMDs require to explicitly enable
      * scatter to support jumbo RX.
@@ -1010,20 +1016,36 @@ dpdk_eth_dev_port_config(struct netdev_dpdk *dev, int n_rxq, int n_txq)
             VLOG_INFO("Retrying setup with (rxq:%d txq:%d)", n_rxq, n_txq);
         }
 
-        diag = rte_eth_dev_configure(dev->port_id, n_rxq, n_txq, &conf);
+        diag = rte_eth_dev_configure(port_id, n_rxq, n_txq, &conf);
         if (diag) {
-            VLOG_WARN("Interface %s eth_dev setup error %s\n",
-                      dev->up.name, rte_strerror(-diag));
+            VLOG_WARN("Interface %s port %d eth_dev setup error %s\n",
+                      dev->up.name, port_id, rte_strerror(-diag));
             break;
         }
+        
+        // for ice need stop dev again.
+        VLOG_INFO("stop1 port %d", port_id);
+        if(dev->devargs_slave1_attached) {
+            rte_eth_dev_stop(dev->slave1_port_id);
+            VLOG_INFO("stop2 port %d", dev->slave1_port_id);
 
-        diag = rte_eth_dev_set_mtu(dev->port_id, dev->mtu);
+        }
+        if(dev->devargs_slave2_attached) {
+            rte_eth_dev_stop(dev->slave2_port_id);
+            VLOG_INFO("stop3 port %d", dev->slave2_port_id);
+
+        }
+        
+        rte_eth_dev_stop(port_id);
+        //rte_eth_dev_stop(1);
+
+        diag = rte_eth_dev_set_mtu(port_id, dev->mtu);
         if (diag) {
             /* A device may not support rte_eth_dev_set_mtu, in this case
              * flag a warning to the user and include the devices configured
              * MTU value that will be used instead. */
             if (-ENOTSUP == diag) {
-                rte_eth_dev_get_mtu(dev->port_id, &conf_mtu);
+                rte_eth_dev_get_mtu(port_id, &conf_mtu);
                 VLOG_WARN("Interface %s does not support MTU configuration, "
                           "max packet size supported is %"PRIu16".",
                           dev->up.name, conf_mtu);
@@ -1035,7 +1057,7 @@ dpdk_eth_dev_port_config(struct netdev_dpdk *dev, int n_rxq, int n_txq)
         }
 
         for (i = 0; i < n_txq; i++) {
-            diag = rte_eth_tx_queue_setup(dev->port_id, i, dev->txq_size,
+            diag = rte_eth_tx_queue_setup(port_id, i, dev->txq_size,
                                           dev->socket_id, NULL);
             if (diag) {
                 VLOG_INFO("Interface %s unable to setup txq(%d): %s",
@@ -1051,7 +1073,7 @@ dpdk_eth_dev_port_config(struct netdev_dpdk *dev, int n_rxq, int n_txq)
         }
 
         for (i = 0; i < n_rxq; i++) {
-            diag = rte_eth_rx_queue_setup(dev->port_id, i, dev->rxq_size,
+            diag = rte_eth_rx_queue_setup(port_id, i, dev->rxq_size,
                                           dev->socket_id, NULL,
                                           dev->dpdk_mp->mp);
             if (diag) {
@@ -1086,9 +1108,109 @@ dpdk_eth_flow_ctrl_setup(struct netdev_dpdk *dev) OVS_REQUIRES(dev->mutex)
 }
 
 static int
+dpdkslave_eth_dev_init(struct netdev_dpdk *dev,dpdk_port_t port_id)
+    OVS_REQUIRES(dev->mutex)
+{
+    VLOG_INFO("start dpdkslave_eth_dev_init port %d", port_id);
+    struct rte_pktmbuf_pool_private *mbp_priv;
+    struct rte_eth_dev_info info;
+    struct rte_ether_addr eth_addr;
+    int diag;
+    int n_rxq, n_txq;
+    uint32_t tx_tso_offload_capa = DPDK_TX_TSO_OFFLOAD_FLAGS;
+    uint32_t rx_chksm_offload_capa = RTE_ETH_RX_OFFLOAD_UDP_CKSUM |
+                                     RTE_ETH_RX_OFFLOAD_TCP_CKSUM |
+                                     RTE_ETH_RX_OFFLOAD_IPV4_CKSUM;
+
+    rte_eth_dev_info_get(port_id, &info);
+
+    if (strstr(info.driver_name, "vf") != NULL) {
+        VLOG_INFO("Virtual function detected, HW_CRC_STRIP will be enabled");
+        dev->hw_ol_features |= NETDEV_RX_HW_CRC_STRIP;
+    } else {
+        dev->hw_ol_features &= ~NETDEV_RX_HW_CRC_STRIP;
+    }
+
+    if ((info.rx_offload_capa & rx_chksm_offload_capa) !=
+            rx_chksm_offload_capa) {
+        VLOG_WARN("Rx checksum offload is not supported on port "
+                  DPDK_PORT_ID_FMT, dev->port_id);
+        dev->hw_ol_features &= ~NETDEV_RX_CHECKSUM_OFFLOAD;
+    } else {
+        dev->hw_ol_features |= NETDEV_RX_CHECKSUM_OFFLOAD;
+    }
+
+    if (info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER) {
+        dev->hw_ol_features |= NETDEV_RX_HW_SCATTER;
+    } else {
+        /* Do not warn on lack of scatter support */
+        dev->hw_ol_features &= ~NETDEV_RX_HW_SCATTER;
+    }
+
+    dev->hw_ol_features &= ~NETDEV_TX_TSO_OFFLOAD;
+    if (userspace_tso_enabled()) {
+        if ((info.tx_offload_capa & tx_tso_offload_capa)
+            == tx_tso_offload_capa) {
+            dev->hw_ol_features |= NETDEV_TX_TSO_OFFLOAD;
+            if (info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_SCTP_CKSUM) {
+                dev->hw_ol_features |= NETDEV_TX_SCTP_CHECKSUM_OFFLOAD;
+            } else {
+                VLOG_WARN("%s: Tx SCTP checksum offload is not supported, "
+                          "SCTP packets sent to this device will be dropped",
+                          netdev_get_name(&dev->up));
+            }
+        } else {
+            VLOG_WARN("%s: Tx TSO offload is not supported.",
+                      netdev_get_name(&dev->up));
+        }
+    }
+
+    n_rxq = MIN(info.max_rx_queues, dev->up.n_rxq);
+    n_txq = MIN(info.max_tx_queues, dev->up.n_txq);
+
+    rte_eth_dev_stop(port_id);
+
+    diag = dpdk_eth_dev_port_config(dev, port_id,n_rxq, n_txq);
+    if (diag) {
+        VLOG_ERR("Interface %s(rxq:%d txq:%d lsc interrupt mode:%s) "
+                 "configure error: %s",
+                 dev->up.name, n_rxq, n_txq,
+                 dev->lsc_interrupt_mode ? "true" : "false",
+                 rte_strerror(-diag));
+        return -diag;
+    }
+
+    diag = rte_eth_dev_start(port_id);
+    if (diag) {
+        VLOG_ERR("Interface %s start error: %s", dev->up.name,
+                 rte_strerror(-diag));
+        return -diag;
+    }
+    dev->started = true;
+
+    netdev_dpdk_configure_xstats(dev);
+
+    rte_eth_promiscuous_enable(port_id);
+    rte_eth_allmulticast_enable(port_id);
+
+    memset(&eth_addr, 0x0, sizeof(eth_addr));
+    rte_eth_macaddr_get(port_id, &eth_addr);
+    VLOG_INFO_RL(&rl, "Port "DPDK_PORT_ID_FMT": "ETH_ADDR_FMT,
+                port_id, ETH_ADDR_BYTES_ARGS(eth_addr.addr_bytes));
+
+    memcpy(dev->hwaddr.ea, eth_addr.addr_bytes, ETH_ADDR_LEN);
+    rte_eth_link_get_nowait(port_id, &dev->link);
+
+    mbp_priv = rte_mempool_get_priv(dev->dpdk_mp->mp);
+    dev->buf_size = mbp_priv->mbuf_data_room_size - RTE_PKTMBUF_HEADROOM;
+    return 0;
+}
+
+static int
 dpdk_eth_dev_init(struct netdev_dpdk *dev)
     OVS_REQUIRES(dev->mutex)
 {
+    VLOG_INFO("start dpdk_eth_dev_init port %d", dev->port_id);
     struct rte_pktmbuf_pool_private *mbp_priv;
     struct rte_eth_dev_info info;
     struct rte_ether_addr eth_addr;
@@ -1145,7 +1267,9 @@ dpdk_eth_dev_init(struct netdev_dpdk *dev)
     n_rxq = MIN(info.max_rx_queues, dev->up.n_rxq);
     n_txq = MIN(info.max_tx_queues, dev->up.n_txq);
 
-    diag = dpdk_eth_dev_port_config(dev, n_rxq, n_txq);
+    rte_eth_dev_stop(dev->port_id);
+
+    diag = dpdk_eth_dev_port_config(dev, dev->port_id, n_rxq, n_txq);
     if (diag) {
         VLOG_ERR("Interface %s(rxq:%d txq:%d lsc interrupt mode:%s) "
                  "configure error: %s",
@@ -1818,6 +1942,42 @@ netdev_dpdk_process_devargs(struct netdev_dpdk *dev,
     return new_port_id;
 }
 
+static dpdk_port_t
+netdev_dpdk_process_slave_devargs(struct netdev_dpdk *dev,
+                            const char *devargs, char **errp)
+    OVS_REQUIRES(dpdk_mutex)
+{
+    dpdk_port_t new_port_id;
+
+    if (strncmp(devargs, "class=eth,mac=", 14) == 0) {
+        new_port_id = netdev_dpdk_get_port_by_mac(&devargs[14]);
+    } else {
+        new_port_id = netdev_dpdk_get_port_by_devargs(devargs);
+        if (!rte_eth_dev_is_valid_port(new_port_id)) {
+            /* Device not found in DPDK, attempt to attach it */
+            if (rte_dev_probe(devargs)) {
+                new_port_id = DPDK_ETH_PORT_ID_INVALID;
+            } else {
+                new_port_id = netdev_dpdk_get_port_by_devargs(devargs);
+                if (rte_eth_dev_is_valid_port(new_port_id)) {
+                    /* Attach successful */
+                    //dev->attached = true;
+                    VLOG_INFO("Device '%s' attached to DPDK", devargs);
+                } else {
+                    /* Attach unsuccessful */
+                    new_port_id = DPDK_ETH_PORT_ID_INVALID;
+                }
+            }
+        }
+    }
+
+    if (new_port_id == DPDK_ETH_PORT_ID_INVALID) {
+        VLOG_WARN_BUF(errp, "Error attaching device '%s' to DPDK", devargs);
+    }
+
+    return new_port_id;
+}
+
 static int
 dpdk_eth_event_callback(dpdk_port_t port_id, enum rte_eth_event_type type,
                         void *param OVS_UNUSED, void *ret_param OVS_UNUSED)
@@ -1874,6 +2034,285 @@ dpdk_process_queue_size(struct netdev *netdev, const struct smap *args,
         *new_size = queue_size;
         netdev_request_reconfigure(netdev);
     }
+}
+
+static int dpdk_bond_mode(const char* mode_str)
+{
+    int mode = 0;
+    mode = atoi(mode_str);
+    return mode;
+}
+
+static int check_bond_dev_by_name(const char* bond_name)
+{
+    dpdk_port_t port_id = -1;
+    int ret = 0;
+    uint16_t slaves_port_id[2] = {-1,-1};
+    VLOG_INFO("check_bond_dev_by_name bond name(%s)\n",bond_name);
+    rte_eth_dev_get_port_by_name(bond_name,&port_id);
+    VLOG_INFO("check_bond_dev_by_name bond port id(%d)\n",port_id);
+    if (rte_eth_dev_is_valid_port(port_id)) {
+        //dev->port_id = port_id;
+        int i = rte_eth_bond_slaves_get(port_id,slaves_port_id,2);
+        VLOG_INFO("check_bond_dev_by_name bond port id(%d) has %d slave port(%lu)\n",port_id,i);
+        VLOG_INFO("check_bond_dev_by_name bond port id(%d),slave1 port(%lu)\n",port_id,slaves_port_id[0]);
+        VLOG_INFO("check_bond_dev_by_name bond port id(%d),slave2 port(%lu)\n",port_id,slaves_port_id[1]);
+        if(rte_eth_dev_is_valid_port(slaves_port_id[0])) {
+            rte_eth_bond_slave_remove(port_id,slaves_port_id[0]);
+        }
+        if(rte_eth_dev_is_valid_port(slaves_port_id[1])) {
+            rte_eth_bond_slave_remove(port_id,slaves_port_id[1]);
+        }
+        ret = rte_eth_bond_free(bond_name);
+        VLOG_INFO("check_bond_dev_by_name rte_eth_bond_free (%s) result(%d)\n",bond_name,ret);
+    }
+    return 0;
+}
+
+static int
+netdev_dpdkbond_set_config(struct netdev *netdev, const struct smap *args,
+                       char **errp)
+{
+    struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
+    bool rx_fc_en, tx_fc_en, autoneg, lsc_interrupt_mode;
+    bool flow_control_requested = true;
+    enum rte_eth_fc_mode fc_mode;
+    static const enum rte_eth_fc_mode fc_mode_set[2][2] = {
+        {RTE_ETH_FC_NONE,     RTE_ETH_FC_TX_PAUSE},
+        {RTE_ETH_FC_RX_PAUSE, RTE_ETH_FC_FULL    }
+    };
+    const char *new_devargs;
+    const char *new_devargs_slave1;
+    const char *new_devargs_slave2;
+    const char *bond_mode_str;
+    const char *vf_mac;
+    int bond_mode;
+    int err = 0;
+
+    ovs_mutex_lock(&dpdk_mutex);
+    ovs_mutex_lock(&dev->mutex);
+
+    dpdk_set_rxq_config(dev, args);
+
+    dpdk_process_queue_size(netdev, args, "n_rxq_desc",
+                            NIC_PORT_DEFAULT_RXQ_SIZE,
+                            &dev->requested_rxq_size);
+    dpdk_process_queue_size(netdev, args, "n_txq_desc",
+                            NIC_PORT_DEFAULT_TXQ_SIZE,
+                            &dev->requested_txq_size);
+
+    // int ret = rte_eal_init(0,NULL);
+    //     VLOG_ERR_BUF(errp, "0 rte init (%d)\n",ret);
+
+    new_devargs_slave1 = smap_get(args, "dpdk-slave1");
+    new_devargs_slave2 = smap_get(args, "dpdk-slave2");
+    bond_mode_str = smap_get(args, "mode");
+    char * bond_name = "net_bonding0";
+    VLOG_INFO("0 bond netdev->name(%s)\n",netdev->name);
+    VLOG_INFO("0 bond name(%s)\n",bond_name);
+    VLOG_INFO("0 new_devargs_slave1(%s)\n",new_devargs_slave1);
+    VLOG_INFO("0 new_devargs_slave2(%s)\n",new_devargs_slave2);
+    VLOG_INFO("0 bond_mode_str(%s)\n",bond_mode_str);
+
+    bond_mode = dpdk_bond_mode(bond_mode_str);
+    VLOG_INFO("0 bond_mode(%d)\n",bond_mode);
+
+    // int nb_ports = rte_eth_dev_count_avail();
+    // VLOG_INFO("0 get dpdk port(%d)\n",nb_ports);
+
+    if (dev->devargs_slave1 && dev->devargs_slave2 && new_devargs_slave1 && new_devargs_slave2 &&
+        !strcmp(new_devargs_slave1, dev->devargs_slave1) && !strcmp(new_devargs_slave2, dev->devargs_slave2)) {
+        /* The user requested a new device.  If we return error, the caller
+         * will delete this netdev and try to recreate it. */
+        err = 0;
+        goto out;
+    }
+    VLOG_INFO("dev->port_id(%d)\n",dev->port_id);
+
+    if (!rte_eth_dev_is_valid_port(dev->port_id)) {
+        // first check bond port exist, if exist free bond port for restart vswitchd.
+        check_bond_dev_by_name(bond_name);
+
+        dpdk_port_t new_port_id = rte_eth_bond_create(bond_name, bond_mode, 0);
+
+        if (!rte_eth_dev_is_valid_port(new_port_id)){
+            VLOG_INFO("1 create dpdkbond port(%s) failed Invalid port(%lu)\n",netdev->name,new_port_id);
+            err = EINVAL;
+            goto out;
+        }
+        VLOG_INFO("1 create dpdkbond port(%s) successful port(%lu)\n",netdev->name,new_port_id);
+        dev->port_id = new_port_id;
+
+    }
+
+    if(new_devargs_slave1 && new_devargs_slave1[0]) {
+        if (!((dev->devargs_slave1 != NULL) && (!strcmp(dev->devargs_slave1, new_devargs_slave1)))){
+            if (!rte_eth_dev_is_valid_port(dev->port_id)) {
+                dpdk_port_t new_port_id = rte_eth_bond_create(bond_name, bond_mode, 0 /*SOCKET_ID_ANY*/);
+
+                if (rte_eth_dev_is_valid_port(new_port_id)) {
+                    dev->port_id = new_port_id;
+                    VLOG_INFO("2 create dpdkbond port(%s) success port(%d)\n",netdev->name,new_port_id);
+                } else {
+    	            VLOG_INFO("2 create dpdkbond port(%s) failed Invalid port(%d)\n",netdev->name,new_port_id);
+                    err = EINVAL;
+                }
+            }
+            dpdk_port_t new_slave1_port_id = netdev_dpdk_process_slave_devargs(dev,new_devargs_slave1,errp);
+            if (rte_eth_dev_is_valid_port(new_slave1_port_id)) {
+                if (rte_eth_bond_slave_add(dev->port_id, new_slave1_port_id) == -1)
+                    VLOG_INFO("add dpdkbond port(%s) slave1 port(%d, %s) failed\n",netdev->name,new_slave1_port_id,new_devargs_slave1);
+                else {
+                    VLOG_INFO("add dpdkbond port(%s) slave1 port(%d, %s) successful\n",netdev->name,new_slave1_port_id,new_devargs_slave1);
+                    dev->devargs_slave1 = xstrdup(new_devargs_slave1);
+                    dev->devargs_slave1_attached = true;
+                    dev->slave1_port_id = new_slave1_port_id;
+                }
+            }
+        }
+    }
+    if(new_devargs_slave2 && new_devargs_slave2[0]) {
+        if (!((dev->devargs_slave2 != NULL) && (!strcmp(dev->devargs_slave2, new_devargs_slave2)))) {
+            if (!rte_eth_dev_is_valid_port(dev->port_id)) {
+                dpdk_port_t new_port_id = rte_eth_bond_create(bond_name, bond_mode, 0 /*SOCKET_ID_ANY*/);
+
+                if (rte_eth_dev_is_valid_port(new_port_id)) {
+                    dev->port_id = new_port_id;
+                    VLOG_INFO("create dpdkbond port(%s) success port(%d)\n",netdev->name,new_port_id);
+                } else {
+                    VLOG_INFO("create dpdkbond port(%s) failed Invalid port(%d)\n",netdev->name,new_port_id);
+                    err = EINVAL;
+                }
+            }
+            dpdk_port_t new_slave2_port_id = netdev_dpdk_process_slave_devargs(dev,new_devargs_slave2,errp);
+            if (rte_eth_dev_is_valid_port(new_slave2_port_id)) {
+                if (rte_eth_bond_slave_add(dev->port_id, new_slave2_port_id) == -1)
+                    VLOG_INFO("add dpdkbond port(%s) slave2 port(%d, %s) failed\n",netdev->name,new_slave2_port_id,new_devargs_slave2);
+                else {
+                    VLOG_INFO("add dpdkbond port(%s) slave2 port(%d, %s) successful\n",netdev->name,new_slave2_port_id,new_devargs_slave2);
+                    dev->devargs_slave2 = xstrdup(new_devargs_slave2);
+                    dev->devargs_slave2_attached = true;
+                    dev->slave2_port_id = new_slave2_port_id;
+                }
+            }
+        }
+    }
+    VLOG_INFO("create dpdkbond port(%s) slave1_port(%d),slave2_port(%d)\n",netdev->name,dev->slave1_port_id,dev->slave2_port_id);
+    // /* dpdk-devargs is required for device configuration */
+    // if (new_devargs && new_devargs[0]) {
+    //     /* Don't process dpdk-devargs if value is unchanged and port id
+    //      * is valid */
+    //     if (!(dev->devargs && !strcmp(dev->devargs, new_devargs)
+    //            && rte_eth_dev_is_valid_port(dev->port_id))) {
+    //         dpdk_port_t new_port_id = netdev_dpdk_process_devargs(dev,
+    //                                                               new_devargs,
+    //                                                               errp);
+    //         if (!rte_eth_dev_is_valid_port(new_port_id)) {
+    //             err = EINVAL;
+    //         } else if (new_port_id == dev->port_id) {
+    //             /* Already configured, do not reconfigure again */
+    //             err = 0;
+    //         } else {
+    //             struct netdev_dpdk *dup_dev;
+
+    //             dup_dev = netdev_dpdk_lookup_by_port_id(new_port_id);
+    //             if (dup_dev) {
+    //                 VLOG_WARN_BUF(errp, "'%s' is trying to use device '%s' "
+    //                               "which is already in use by '%s'",
+    //                               netdev_get_name(netdev), new_devargs,
+    //                               netdev_get_name(&dup_dev->up));
+    //                 err = EADDRINUSE;
+    //             } else {
+    //                 int sid = rte_eth_dev_socket_id(new_port_id);
+
+    //                 dev->requested_socket_id = sid < 0 ? SOCKET0 : sid;
+    //                 dev->devargs = xstrdup(new_devargs);
+    //                 dev->port_id = new_port_id;
+    //                 netdev_request_reconfigure(&dev->up);
+    //                 err = 0;
+    //             }
+    //         }
+    //     }
+    // } else {
+    //     VLOG_WARN_BUF(errp, "'%s' is missing 'options:dpdk-devargs'. "
+    //                         "The old 'dpdk<port_id>' names are not supported",
+    //                   netdev_get_name(netdev));
+    //     err = EINVAL;
+    // }
+
+    // if (err) {
+    //     goto out;
+    // }
+
+    // vf_mac = smap_get(args, "dpdk-vf-mac");
+    // if (vf_mac) {
+    //     struct eth_addr mac;
+
+    //     if (!dpdk_port_is_representor(dev)) {
+    //         VLOG_WARN_BUF(errp, "'%s' is trying to set the VF MAC '%s' "
+    //                       "but 'options:dpdk-vf-mac' is only supported for "
+    //                       "VF representors.",
+    //                       netdev_get_name(netdev), vf_mac);
+    //     } else if (!eth_addr_from_string(vf_mac, &mac)) {
+    //         VLOG_WARN_BUF(errp, "interface '%s': cannot parse VF MAC '%s'.",
+    //                       netdev_get_name(netdev), vf_mac);
+    //     } else if (eth_addr_is_multicast(mac)) {
+    //         VLOG_WARN_BUF(errp,
+    //                       "interface '%s': cannot set VF MAC to multicast "
+    //                       "address '%s'.", netdev_get_name(netdev), vf_mac);
+    //     } else if (!eth_addr_equals(dev->requested_hwaddr, mac)) {
+    //         dev->requested_hwaddr = mac;
+    //         netdev_request_reconfigure(netdev);
+    //     }
+    // }
+
+    // lsc_interrupt_mode = smap_get_bool(args, "dpdk-lsc-interrupt", false);
+    // if (dev->requested_lsc_interrupt_mode != lsc_interrupt_mode) {
+    //     dev->requested_lsc_interrupt_mode = lsc_interrupt_mode;
+    //     netdev_request_reconfigure(netdev);
+    // }
+
+    // rx_fc_en = smap_get_bool(args, "rx-flow-ctrl", false);
+    // tx_fc_en = smap_get_bool(args, "tx-flow-ctrl", false);
+    // autoneg = smap_get_bool(args, "flow-ctrl-autoneg", false);
+
+    // fc_mode = fc_mode_set[tx_fc_en][rx_fc_en];
+
+    // if (!smap_get(args, "rx-flow-ctrl") && !smap_get(args, "tx-flow-ctrl")
+    //     && !smap_get(args, "flow-ctrl-autoneg")) {
+    //     /* FIXME: User didn't ask for flow control configuration.
+    //      *        For now we'll not print a warning if flow control is not
+    //      *        supported by the DPDK port. */
+    //     flow_control_requested = false;
+    // }
+
+    // /* Get the Flow control configuration. */
+    // err = -rte_eth_dev_flow_ctrl_get(dev->port_id, &dev->fc_conf);
+    // if (err) {
+    //     if (err == ENOTSUP) {
+    //         if (flow_control_requested) {
+    //             VLOG_WARN("%s: Flow control is not supported.",
+    //                       netdev_get_name(netdev));
+    //         }
+    //         err = 0; /* Not fatal. */
+    //     } else {
+    //         VLOG_WARN("%s: Cannot get flow control parameters: %s",
+    //                   netdev_get_name(netdev), rte_strerror(err));
+    //     }
+    //     goto out;
+    // }
+
+    // if (dev->fc_conf.mode != fc_mode || autoneg != dev->fc_conf.autoneg) {
+    //     dev->fc_conf.mode = fc_mode;
+    //     dev->fc_conf.autoneg = autoneg;
+    //     dpdk_eth_flow_ctrl_setup(dev);
+    // }
+
+out:
+    ovs_mutex_unlock(&dev->mutex);
+    ovs_mutex_unlock(&dpdk_mutex);
+
+    return err;
 }
 
 static int
@@ -4935,6 +5374,109 @@ static const struct dpdk_qos_ops trtcm_policer_ops = {
 };
 
 static int
+netdev_dpdkbond_reconfigure(struct netdev *netdev)
+{
+    struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
+    int err = 0;
+
+    ovs_mutex_lock(&dev->mutex);
+
+    if (netdev->n_txq == dev->requested_n_txq
+        && netdev->n_rxq == dev->requested_n_rxq
+        && dev->mtu == dev->requested_mtu
+        && dev->lsc_interrupt_mode == dev->requested_lsc_interrupt_mode
+        && dev->rxq_size == dev->requested_rxq_size
+        && dev->txq_size == dev->requested_txq_size
+        && eth_addr_equals(dev->hwaddr, dev->requested_hwaddr)
+        && dev->socket_id == dev->requested_socket_id
+        && dev->started && !dev->reset_needed) {
+        /* Reconfiguration is unnecessary */
+
+        goto out;
+    }
+
+    if (dev->reset_needed) {
+        rte_eth_dev_reset(dev->port_id);
+        if_notifier_manual_report();
+        dev->reset_needed = false;
+    } else {
+        rte_eth_dev_stop(dev->port_id);
+    }
+
+    dev->started = false;
+
+    err = netdev_dpdk_mempool_configure(dev);
+    if (err && err != EEXIST) {
+        goto out;
+    }
+
+    dev->lsc_interrupt_mode = dev->requested_lsc_interrupt_mode;
+
+    netdev->n_txq = dev->requested_n_txq;
+    netdev->n_rxq = dev->requested_n_rxq;
+
+    dev->rxq_size = dev->requested_rxq_size;
+    dev->txq_size = dev->requested_txq_size;
+
+    rte_free(dev->tx_q);
+
+    if (!eth_addr_equals(dev->hwaddr, dev->requested_hwaddr)) {
+        err = netdev_dpdk_set_etheraddr__(dev, dev->requested_hwaddr);
+        if (err) {
+            goto out;
+        }
+    }
+
+    if (dev->devargs_slave1_attached){
+        VLOG_INFO("start dpdkslave1_eth_dev_init1 port %d(%s)", dev->slave1_port_id,dev->devargs_slave1);
+        if (0 != (err = dpdkslave_eth_dev_init(dev,dev->slave1_port_id))) {
+            VLOG_ERR("dpdk init bond(%d) slave(%s) failed", dev->port_id,dev->devargs_slave1);
+        }
+    }
+
+    if (dev->devargs_slave2_attached){
+        VLOG_INFO("start dpdkslave2_eth_dev_init1 port %d(%s)", dev->slave2_port_id,dev->devargs_slave2);
+        if (0 != (err = dpdkslave_eth_dev_init(dev,dev->slave2_port_id))) {
+            VLOG_ERR("dpdk init bond(%d) slave(%s) failed", dev->port_id,dev->devargs_slave2);
+        }
+    }
+
+    err = dpdk_eth_dev_init(dev);
+    if (dev->hw_ol_features & NETDEV_TX_TSO_OFFLOAD) {
+        netdev->ol_flags |= NETDEV_TX_OFFLOAD_TCP_TSO;
+        netdev->ol_flags |= NETDEV_TX_OFFLOAD_TCP_CKSUM;
+        netdev->ol_flags |= NETDEV_TX_OFFLOAD_UDP_CKSUM;
+        netdev->ol_flags |= NETDEV_TX_OFFLOAD_IPV4_CKSUM;
+        if (dev->hw_ol_features & NETDEV_TX_SCTP_CHECKSUM_OFFLOAD) {
+            netdev->ol_flags |= NETDEV_TX_OFFLOAD_SCTP_CKSUM;
+        }
+    }
+
+    /* If both requested and actual hwaddr were previously
+     * unset (initialized to 0), then first device init above
+     * will have set actual hwaddr to something new.
+     * This would trigger spurious MAC reconfiguration unless
+     * the requested MAC is kept in sync.
+     *
+     * This is harmless in case requested_hwaddr was
+     * configured by the user, as netdev_dpdk_set_etheraddr__()
+     * will have succeeded to get to this point.
+     */
+    dev->requested_hwaddr = dev->hwaddr;
+
+    dev->tx_q = netdev_dpdk_alloc_txq(netdev->n_txq);
+    if (!dev->tx_q) {
+        err = ENOMEM;
+    }
+
+    netdev_change_seq_changed(netdev);
+
+out:
+    ovs_mutex_unlock(&dev->mutex);
+    return err;
+}
+
+static int
 netdev_dpdk_reconfigure(struct netdev *netdev)
 {
     struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
@@ -5430,6 +5972,16 @@ netdev_dpdk_rte_flow_tunnel_item_release(struct netdev *netdev,
     .reconfigure = netdev_dpdk_reconfigure,             \
     .rxq_recv = netdev_dpdk_rxq_recv
 
+
+static const struct netdev_class dpdkbond_class = {
+    .type = "dpdkbond",
+    NETDEV_DPDK_CLASS_BASE,
+    .construct = netdev_dpdk_construct,
+    .set_config = netdev_dpdkbond_set_config,
+    .send = netdev_dpdk_eth_send,
+    .reconfigure = netdev_dpdkbond_reconfigure,
+};
+
 static const struct netdev_class dpdk_class = {
     .type = "dpdk",
     NETDEV_DPDK_CLASS_BASE,
@@ -5437,6 +5989,7 @@ static const struct netdev_class dpdk_class = {
     .set_config = netdev_dpdk_set_config,
     .send = netdev_dpdk_eth_send,
 };
+
 
 static const struct netdev_class dpdk_vhost_class = {
     .type = "dpdkvhostuser",
@@ -5475,4 +6028,5 @@ netdev_dpdk_register(void)
     netdev_register_provider(&dpdk_class);
     netdev_register_provider(&dpdk_vhost_class);
     netdev_register_provider(&dpdk_vhost_client_class);
+    netdev_register_provider(&dpdkbond_class);
 }

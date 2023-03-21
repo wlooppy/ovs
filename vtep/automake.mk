@@ -34,7 +34,8 @@ man_MANS += \
    vtep/vtep-ctl.8
 
 vtep_vtep_ctl_SOURCES = vtep/vtep-ctl.c
-vtep_vtep_ctl_LDADD = vtep/libvtep.la lib/libopenvswitch.la
+vtep_vtep_ctl_LDADD = vtep/libvtep.la lib/libopenvswitch.la \
+	/usr/src/dpdk-stable-21.11.1/build/drivers/librte_net_bond.a
 
 # ovs-vtep
 scripts_SCRIPTS += \
